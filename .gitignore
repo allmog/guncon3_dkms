@@ -1,0 +1,17 @@
+# kernel build output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.module-common.o
+Module.symvers
+modules.order
+# tests
+tests/test_proto
+tests/gadget/guncon3_gadget
+__pycache__/
+# makepkg
+packaging/arch/*.pkg.tar.*
+packaging/arch/pkg/
+packaging/arch/src/
