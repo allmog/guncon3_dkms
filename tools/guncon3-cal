@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""
+guncon3-cal: calibrate GunCon 3 guns through the driver's sysfs interface.
+
+    guncon3-cal list                       guns, their USB port and calibration
+    guncon3-cal calibrate [PORT] [--save]  aim at 4 corners + centre, pull the trigger
+    guncon3-cal get PORT
+    guncon3-cal set PORT X_MIN X_MAX Y_MIN Y_MAX [--save]
+    guncon3-cal reset PORT [--save]
+
+PORT is the USB interface name shown by "list" (e.g. 3-2:1.0); it may be
+omitted when only one gun is connected. --save writes
+/etc/guncon3/PORT.conf, which udev re-applies whenever a gun is plugged into
+that port. Writing calibration needs root.
+
+Calibration is terminal-only on purpose: it works over SSH while you stand
+at the TV, under gamescope, and with no display server at all.
+"""
+import argparse
+import os
+import sys
+import time
+
+DRIVER = "/sys/bus/usb/drivers/guncon3"
+CONF_DIR = "/etc/guncon3"
+TRIGGER = 0x002000
+OFFSCREEN = 0x000800
+
+
+def ports():
+    try:
+        names = os.listdir(DRIVER)
+    except FileNotFoundError:
+        sys.exit("guncon3 driver is not loaded (modprobe guncon3)")
+    return sorted(n for n in names if os.path.exists(os.path.join(DRIVER, n, "calibration")))
+
+
+def pick_port(port):
+    found = ports()
+    if port:
+        if port not in found:
+            sys.exit(f"no gun on port {port}; connected: {', '.join(found) or 'none'}")
+        return port
+    if len(found) != 1:
+        sys.exit(f"{len(found)} guns connected, pass a PORT: {', '.join(found) or 'none'}")
+    return found[0]
+
+
+def read_attr(port, attr):
+    with open(os.path.join(DRIVER, port, attr)) as f:
+        return f.read().strip()
+
+
+def write_calibration(port, value, save):
+    try:
+        with open(os.path.join(DRIVER, port, "calibration"), "w") as f:
+            f.write(value)
+    except PermissionError:
+        sys.exit("permission denied: run with sudo")
+    except OSError as err:
+        sys.exit(f"driver rejected calibration {value!r}: {err.strerror}")
+    print(f"{port}: calibration {read_attr(port, 'calibration')}")
+    if save:
+        os.makedirs(CONF_DIR, exist_ok=True)
+        path = os.path.join(CONF_DIR, f"{port}.conf")
+        with open(path, "w") as f:
+            f.write("# x_min x_max y_min y_max, raw sensor units; written by guncon3-cal\n")
+            f.write(read_attr(port, "calibration") + "\n")
+        print(f"saved to {path}")
+
+
+def read_raw(port):
+    """Returns (x, y, buttons), or None until the gun has sent a report."""
+    try:
+        x, y, _z, buttons = read_attr(port, "raw").split()
+    except OSError:
+        return None
+    return int(x), int(y), int(buttons, 16)
+
+
+def wait_shot(port, label):
+    """Wait for a trigger pull while on screen; returns the raw aim at that moment."""
+    print(f"  aim at the {label} and pull the trigger", end="", flush=True)
+    released = False
+    while True:
+        raw = read_raw(port)
+        if raw:
+            x, y, buttons = raw
+            pressed = bool(buttons & TRIGGER)
+            if not pressed:
+                released = True
+            elif released:
+                if buttons & OFFSCREEN:
+                    print("\n  the gun does not see the sensor bar there; try again", end="", flush=True)
+                    released = False
+                    continue
+                print(f"   raw {x} {y}")
+                return x, y
+        time.sleep(0.01)
+
+
+def calibrate(port, save):
+    if read_raw(port) is None:
+        sys.exit("no reports from the gun yet: something must have its input device open "
+                 "(start evtest or the game on it, or run: evtest /dev/input/by-id/...)")
+
+    # The raw window only makes sense uncalibrated, but raw values don't
+    # depend on the calibration, so nothing needs resetting first.
+    print(f"Calibrating {port}. Stand where you will play.")
+    tl = wait_shot(port, "TOP-LEFT corner")
+    tr = wait_shot(port, "TOP-RIGHT corner")
+    br = wait_shot(port, "BOTTOM-RIGHT corner")
+    bl = wait_shot(port, "BOTTOM-LEFT corner")
+
+    x_min = round((tl[0] + bl[0]) / 2)
+    x_max = round((tr[0] + br[0]) / 2)
+    y_min = round((tl[1] + tr[1]) / 2)
+    y_max = round((bl[1] + br[1]) / 2)
+    if x_min == x_max or y_min == y_max:
+        sys.exit("corners collapsed onto one point; check the sensor bar and try again")
+
+    centre = wait_shot(port, "CENTRE (accuracy check)")
+    ex = ((centre[0] - x_min) / (x_max - x_min) - 0.5) * 100
+    ey = ((centre[1] - y_min) / (y_max - y_min) - 0.5) * 100
+    print(f"  centre lands {ex:+.1f}% horizontally, {ey:+.1f}% vertically off the middle")
+    if abs(ex) > 5 or abs(ey) > 5:
+        print("  more than 5% off: the screen edges probably bend for this sensor position "
+              "(or a corner shot slipped); consider recalibrating")
+
+    write_calibration(port, f"{x_min} {x_max} {y_min} {y_max}", save)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    c = sub.add_parser("calibrate")
+    c.add_argument("port", nargs="?")
+    c.add_argument("--save", action="store_true")
+    g = sub.add_parser("get")
+    g.add_argument("port", nargs="?")
+    s = sub.add_parser("set")
+    s.add_argument("port")
+    s.add_argument("values", nargs=4, type=int)
+    s.add_argument("--save", action="store_true")
+    r = sub.add_parser("reset")
+    r.add_argument("port", nargs="?")
+    r.add_argument("--save", action="store_true")
+    args = ap.parse_args()
+
+    if args.cmd == "list":
+        found = ports()
+        if not found:
+            print("no guns connected")
+        for port in found:
+            saved = os.path.exists(os.path.join(CONF_DIR, f"{port}.conf"))
+            print(f"{port}  calibration {read_attr(port, 'calibration')}"
+                  f"{'  (saved)' if saved else ''}")
+    elif args.cmd == "calibrate":
+        calibrate(pick_port(args.port), args.save)
+    elif args.cmd == "get":
+        print(read_attr(pick_port(args.port), "calibration"))
+    elif args.cmd == "set":
+        write_calibration(pick_port(args.port), " ".join(map(str, args.values)), args.save)
+    elif args.cmd == "reset":
+        write_calibration(pick_port(args.port), "reset", args.save)
+
+
+if __name__ == "__main__":
+    main()

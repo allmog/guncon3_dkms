@@ -1,0 +1,12 @@
+#!/bin/sh
+# Called by 70-guncon3.rules when the driver binds a gun: re-applies the
+# calibration saved for that USB port, if any.
+intf="$1"
+case "$intf" in
+	*[!0-9.:-]* | "") exit 1 ;;
+esac
+conf="/etc/guncon3/$intf.conf"
+[ -r "$conf" ] || exit 0
+cal=$(grep -v '^[[:space:]]*#' "$conf" | head -n 1)
+[ -n "$cal" ] || exit 0
+printf '%s\n' "$cal" > "/sys/bus/usb/drivers/guncon3/$intf/calibration"

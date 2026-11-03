@@ -1,0 +1,18 @@
+# Namco GunCon 3 (0b9a:0800)
+#
+# Numbered below 73 so the uaccess tags land before 73-seat-late.rules.
+
+# Raw USB access for the logged-in user: RPCS3 passes the real gun through to
+# the emulated PS3 with libusb (and detaches the kernel driver while it does).
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0b9a", ATTR{idProduct}=="0800", TAG+="uaccess"
+
+# The pointer is an absolute mouse. RetroArch's udev lightgun driver reads it
+# directly, so the user needs access; keep it away from libinput so that, in
+# gamescope or a desktop session, two guns do not fight over the cursor.
+# Delete the LIBINPUT_IGNORE_DEVICE part to use a gun as a desktop mouse.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Namco GunCon 3 Pointer", TAG+="uaccess", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Namco GunCon 3 Pad", TAG+="uaccess"
+
+# Restore the saved calibration for the USB port the gun is plugged into
+# (written by guncon3-cal save, /etc/guncon3/<interface>.conf).
+ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="guncon3", RUN+="/usr/lib/guncon3/guncon3-restore %k"

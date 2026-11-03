@@ -1,0 +1,35 @@
+# Maintainer: allmog <allmog@gmail.com>
+#
+# Local build from this checkout: cd packaging/arch && makepkg -si
+# The dkms package's pacman hooks build the module for every installed kernel
+# that has headers (linux-cachyos-*-headers), now and on kernel updates.
+
+pkgname=guncon3-dkms
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Namco GunCon 3 USB light gun driver (DKMS), with udev rules and calibration tool"
+arch=('any')
+url="https://github.com/allmog/guncon3_dkms"
+license=('GPL-2.0-only')
+depends=('dkms')
+optdepends=('python: guncon3-cal calibration tool'
+            'evtest: checking the gun works')
+source=()
+
+_root="$startdir/../.."
+
+package() {
+	local dest="$pkgdir/usr/src/guncon3-$pkgver"
+
+	install -Dm644 "$_root/dkms.conf" "$dest/dkms.conf"
+	install -Dm644 "$_root/src/Makefile" "$dest/src/Makefile"
+	install -Dm644 "$_root/src/guncon3.c" "$dest/src/guncon3.c"
+	install -Dm644 "$_root/src/guncon3_proto.h" "$dest/src/guncon3_proto.h"
+
+	install -Dm644 "$_root/udev/70-guncon3.rules" "$pkgdir/usr/lib/udev/rules.d/70-guncon3.rules"
+	install -Dm755 "$_root/udev/guncon3-restore" "$pkgdir/usr/lib/guncon3/guncon3-restore"
+	install -Dm644 "$_root/udev/70-guncon3.hwdb.example" \
+		"$pkgdir/usr/share/doc/guncon3/70-guncon3.hwdb.example"
+	install -Dm755 "$_root/tools/guncon3-cal" "$pkgdir/usr/bin/guncon3-cal"
+	install -Dm644 "$_root/README.md" "$pkgdir/usr/share/doc/guncon3/README.md"
+}

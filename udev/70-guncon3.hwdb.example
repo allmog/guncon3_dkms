@@ -1,0 +1,17 @@
+# Example button remap for the GunCon 3. Copy to /etc/udev/hwdb.d/70-guncon3.hwdb,
+# edit, then: systemd-hwdb update && udevadm trigger -s input
+#
+# The scancode is the button's index in the driver's table, the same on both
+# devices of a gun:
+#   0 Trigger   1 A1   2 A2   3 A3 (A-stick click)
+#   4 B1        5 B2   6 B3 (B-stick click)   7 C1   8 C2
+# Values are input-event-codes names, lower case, without KEY_ (btn_* keep it).
+
+# Pad: swap Trigger to BTN_EAST
+evdev:name:Namco GunCon 3 Pad:*
+ KEYBOARD_KEY_0=btn_east
+
+# Pointer: put C1/C2 on the mouse device too, e.g. as keyboard keys
+evdev:name:Namco GunCon 3 Pointer:*
+ KEYBOARD_KEY_7=esc
+ KEYBOARD_KEY_8=enter
