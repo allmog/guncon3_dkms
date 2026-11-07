@@ -7,9 +7,9 @@ Supports two guns at once.
 Fork of [pcnimdock/guncon3_dkms](https://github.com/pcnimdock/guncon3_dkms), which in
 turn builds on beardypig's GunCon 2 driver and GunCon 3 protocol work.
 
-> **Status:** tested end to end against an emulated gun (see [Testing](#testing)), not
-> yet against real hardware. Items still to confirm on a real gun are listed under
-> [Unverified](#unverified).
+> **Status:** works on real hardware (two guns, CachyOS) and is tested end to end
+> against an emulated gun (see [Testing](#testing)). Details and what is still open:
+> [Hardware status](#hardware-status).
 
 ## What it provides
 
@@ -40,7 +40,7 @@ A1/A2/A3 = L1/L2/L3, B1/B2/B3 = R1/R2/R3, C1 = Select, C2 = Start.
 |---|---|---|
 | `pad` | `1` | Register the pad device (load time only) |
 | `stick_dpad` | `1` | Report the A-stick as a D-pad too |
-| `deadzone` | `20` | D-pad deadzone around the stick centre (128) |
+| `deadzone` | `64` | D-pad press threshold from the stick centre (128); releases at half that |
 | `offscreen_edge` | `1` | Pin the pointer to 0,0 while offscreen |
 | `key_resend` | `8` | Re-send the key after this many bad reports in a row (0 = never) |
 
@@ -63,16 +63,20 @@ want to use a gun as a mouse.
 
 ## Calibration
 
-Something has to have the gun's input device open (a game, or `evtest`), because the gun
-only reports while it is open. Then:
-
 ```sh
 guncon3-cal list
+sudo guncon3-cal watch 3-2:1.0              # live aim: check the sensors see you everywhere
 sudo guncon3-cal calibrate 3-2:1.0 --save   # port from "list"; aim at 4 corners + centre
 ```
 
-The tool runs in a terminal, so it works over SSH while you stand at the screen. `--save`
-writes `/etc/guncon3/<port>.conf`, re-applied whenever a gun is plugged into that port.
+The tool holds the gun open itself while it runs and works over SSH while you stand at
+the screen. Stand where you will play, and keep sunlight and lamps out of the gun's view:
+light reflected in the screen reads as offscreen. `--save` writes
+`/etc/guncon3/<port>.conf`, re-applied whenever a gun is plugged into that port.
+
+Calibration is `x_min x_max y_min y_max x_mid y_mid` in raw units. The centre matters:
+on a real gun the corners alone left the middle of the screen ~6% off, so each half of
+each axis is mapped separately. Four values (no centre) are still accepted.
 The raw interface is `/sys/bus/usb/drivers/guncon3/<port>/{calibration,raw}`.
 
 ## Using it
@@ -97,15 +101,17 @@ button on both devices, offscreen, sticks/D-pad/distance, corrupt-report recover
 re-send, sysfs calibration, remapping, two guns side by side, close/reopen,
 unbind/rebind (the RPCS3 path) and unplug while open.
 
-## Unverified
+## Hardware status
 
-Decoding agrees with both the upstream driver and the Windows driver
-([gameotaku79/Guncon3Windows](https://github.com/gameotaku79/Guncon3Windows)), but a real
-gun still needs to confirm:
+Tested with two real GunCon 3s (2026-11-07):
 
-- the offscreen bit (`0x000800`, as the Windows driver uses it) and the second status bit
-  (`0x001000`; upstream had `0x000100`);
-- stick and Y-axis orientation, and which physical stick is "A";
-- the endpoint sizes and polling interval of the real device;
-- RetroArch's offscreen detection with the pointer at 0,0;
-- RPCS3 passthrough detaching and re-attaching the driver.
+- **Confirmed:** key exchange and decoding; endpoints (OUT 8 bytes, IN 15 bytes, 4 ms);
+  all 9 buttons; both sticks (front grip = A on `ABS_X/Y`, back thumb = B on
+  `ABS_RX/RY`; right = 255, up = 0); offscreen bit `0x000800`; aim and calibration;
+  close/reopen; hotplug of a second gun.
+- **Found and fixed on hardware:** D-pad chatter from off-axis stick drift (now with
+  hysteresis), and an all-zero first report that pressed D-pad up-left for a frame.
+- **Not understood yet:** status bits `0x000100` (toggles irregularly), `0x001000` and
+  `0x200000`. None is needed for aim; the gun tracks fine with all three clear.
+- **Still to test:** RetroArch's offscreen handling with the pointer at 0,0, and RPCS3
+  passthrough detaching and re-attaching the driver.

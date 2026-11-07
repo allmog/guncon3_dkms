@@ -199,6 +199,24 @@ def test_axes_and_buttons(gun):
     check(abs_value(gun.pad, e.ABS_DISTANCE) == 1234, "z -> ABS_DISTANCE")
     gun.state(ax=128 + 15, ay=128 - 15)
     check(wait_for(lambda: not keys(gun.pad)), "inside the deadzone -> no D-pad")
+    # Real gun, held right: Y drifts to ~175. Must not chatter DPAD_DOWN.
+    gun.state(ax=255, ay=175)
+    check(wait_for(lambda: keys(gun.pad) == {e.BTN_DPAD_RIGHT}),
+          f"right with off-axis drift -> D-pad right only (got {keys(gun.pad)})")
+    gun.state(ax=128 + 40, ay=128)
+    check(wait_for(lambda: abs_value(gun.pad, e.ABS_X) == 168) and keys(gun.pad) == {e.BTN_DPAD_RIGHT},
+          "easing back past the press threshold keeps the D-pad held (hysteresis)")
+    gun.state(ax=128 + 20, ay=128)
+    check(wait_for(lambda: not keys(gun.pad)), "back inside half the deadzone -> released")
+    # Real guns send one all-zero report right after the key.
+    gun.state(x=500, y=600)
+    wait_for(lambda: abs_value(gun.pointer, e.ABS_X) != 32768)
+    before = (abs_value(gun.pointer, e.ABS_X), abs_value(gun.pad, e.ABS_X))
+    gun.state(ax=0, ay=0, bx=0, by=0)
+    time.sleep(0.15)
+    check((abs_value(gun.pointer, e.ABS_X), abs_value(gun.pad, e.ABS_X)) == before and not keys(gun.pad),
+          "an all-zero report is ignored (no D-pad up-left, aim unchanged)")
+    gun.state()
 
 
 def test_corrupt_reports(gun):
@@ -227,19 +245,34 @@ def test_calibration(gun):
     print(f"gun {gun.index}: sysfs calibration")
     cal = gun.sysfs("calibration")
     with open(cal) as f:
-        check(f.read().split() == ["-32768", "32767", "32767", "-32768"], "default calibration")
+        check(f.read().split() == ["-32768", "32767", "32767", "-32768", "0", "0"], "default calibration")
     with open(cal, "w") as f:
         f.write("-1000 1000 1000 -1000")
-    for x, want in ((-1000, 0), (0, 32767), (1000, 65535), (-5000, 0), (5000, 65535)):
+    with open(cal) as f:
+        check(f.read().split() == ["-1000", "1000", "1000", "-1000", "0", "0"],
+              "4 values: centre defaults to the midpoint")
+    for x, want in ((-1000, 0), (0, 32768), (1000, 65535), (-5000, 0), (5000, 65535)):
         gun.state(x=x)
         check(wait_for(lambda: abs_value(gun.pointer, e.ABS_X) == want),
               f"calibrated x={x} -> {want} (clamped outside the window)")
+    # A real gun's calibration (2026-11-07): centre ~6% off the corners' midpoint.
+    with open(cal, "w") as f:
+        f.write("-16190 16008 520 -12752 -1910 -6410")
+    for x, y, want_x, want_y in ((-16190, 520, 0, 0), (-1910, -6410, 32768, 32768),
+                                 (16008, -12752, 65535, 65535), (-9050, -2945, 16384, 16384),
+                                 (7049, -9581, 49151, 49151)):
+        gun.state(x=x, y=y)
+        check(wait_for(lambda: (abs_value(gun.pointer, e.ABS_X), abs_value(gun.pointer, e.ABS_Y))
+                       == (want_x, want_y)),
+              f"centre-aware: raw {x},{y} -> {want_x},{want_y} "
+              f"(got {abs_value(gun.pointer, e.ABS_X)},{abs_value(gun.pointer, e.ABS_Y)})")
     gun.state(x=123, y=-456, z=7, buttons=TRIGGER)
     time.sleep(0.1)
     with open(gun.sysfs("raw")) as f:
         raw = f.read().split()
     check(raw[:3] == ["123", "-456", "7"] and int(raw[3], 16) == TRIGGER, f"raw shows uncalibrated input ({raw})")
-    for bad in ("1 1 2 3", "garbage", "0 1 2"):
+    for bad in ("1 1 2 3", "garbage", "0 1 2", "-1000 1000 1000 -1000 0",
+                "-1000 1000 1000 -1000 1500 0", "-1000 1000 1000 -1000 0 1000"):
         try:
             with open(cal, "w") as f:
                 f.write(bad)
@@ -249,7 +282,7 @@ def test_calibration(gun):
     with open(cal, "w") as f:
         f.write("reset")
     with open(cal) as f:
-        check(f.read().split() == ["-32768", "32767", "32767", "-32768"], "reset restores defaults")
+        check(f.read().split() == ["-32768", "32767", "32767", "-32768", "0", "0"], "reset restores defaults")
     gun.state()
 
 

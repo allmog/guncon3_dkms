@@ -10,7 +10,8 @@
  * Every gun registers two input devices:
  *  - "pointer": an absolute mouse (ABS_X/ABS_Y + mouse buttons), which is
  *    what RetroArch's udev lightgun driver reads. Aim is mapped through a
- *    per-gun calibration window (sysfs "calibration") onto 0..65535.
+ *    per-gun calibration (sysfs "calibration": edges plus the screen centre,
+ *    each half of each axis linear) onto 0..65535.
  *  - "pad": every button, both sticks and the distance sensor, laid out
  *    like RPCS3's default GunCon 3 mapping.
  * Button codes on both are remappable through udev hwdb (EVIOCSKEYCODE).
@@ -43,9 +44,9 @@ static bool stick_dpad = true;
 module_param(stick_dpad, bool, 0644);
 MODULE_PARM_DESC(stick_dpad, "Also report the A-stick as a D-pad on the pad device (default: on)");
 
-static uint deadzone = 20;
+static uint deadzone = 64;
 module_param(deadzone, uint, 0644);
-MODULE_PARM_DESC(deadzone, "A-stick D-pad deadzone around the 128 centre (default: 20)");
+MODULE_PARM_DESC(deadzone, "A-stick D-pad press threshold from the 128 centre; releases at half (default: 64)");
 
 static bool offscreen_edge = true;
 module_param(offscreen_edge, bool, 0644);
@@ -77,15 +78,22 @@ static const struct guncon3_button guncon3_buttons[] = {
 
 #define GUNCON3_NBUTTONS ARRAY_SIZE(guncon3_buttons)
 
+/*
+ * The centre is calibrated separately because a real gun's aim is not linear
+ * across the screen: with the corners right, its centre landed ~6% off. Each
+ * half of each axis gets its own linear map.
+ */
 struct guncon3_calibration {
 	s32 x_min, x_max;	/* raw values that map to the left/right edge */
 	s32 y_min, y_max;	/* top/bottom; min > max inverts the axis */
+	s32 x_mid, y_mid;	/* raw values that map to the screen centre */
 };
 
 /* Raw Y grows upwards, screen Y downwards. */
 static const struct guncon3_calibration guncon3_default_calibration = {
 	.x_min = -32768, .x_max = 32767,
 	.y_min = 32767, .y_max = -32768,
+	.x_mid = 0, .y_mid = 0,
 };
 
 struct guncon3 {
@@ -120,14 +128,23 @@ struct guncon3 {
 	char pad_phys[64];
 };
 
-static int guncon3_map_axis(s32 raw, s32 min, s32 max)
+/* raw in [from, to] -> [out_from, out_to], clamped to that range. */
+static int guncon3_lerp(s32 raw, s32 from, s32 to, int out_from, int out_to)
 {
-	s64 v;
+	s64 v = out_from + div_s64((s64)(raw - from) * (out_to - out_from), to - from);
 
-	if (min == max)
-		return 0;
-	v = div_s64((s64)(raw - min) * GUNCON3_AXIS_MAX, max - min);
-	return clamp_t(s64, v, 0, GUNCON3_AXIS_MAX);
+	return clamp_t(s64, v, out_from, out_to);
+}
+
+/* min, mid and max are validated to be distinct and in order (either way). */
+static int guncon3_map_axis(s32 raw, s32 min, s32 mid, s32 max)
+{
+	const int half = GUNCON3_AXIS_MAX / 2 + 1;
+	bool first_half = min < max ? raw < mid : raw > mid;
+
+	if (first_half)
+		return guncon3_lerp(raw, min, mid, 0, half);
+	return guncon3_lerp(raw, mid, max, half, GUNCON3_AXIS_MAX);
 }
 
 /* MSC_SCAN carries the keymap index, only on change, like HID does. */
@@ -143,6 +160,18 @@ static void guncon3_report_buttons(struct input_dev *dev, const unsigned short *
 			input_event(dev, EV_MSC, MSC_SCAN, i);
 		input_report_key(dev, keymap[i], buttons & guncon3_buttons[i].mask);
 	}
+}
+
+/*
+ * One D-pad direction from a stick offset, with hysteresis: press beyond dz,
+ * release only once back inside dz/2. A held stick drifts off-axis by up to
+ * ~50 on a real gun, which made a single threshold chatter.
+ */
+static void guncon3_dpad(struct input_dev *dev, unsigned int code, int offset, int dz)
+{
+	bool down = test_bit(code, dev->key) ? offset > dz / 2 : offset > dz;
+
+	input_report_key(dev, code, down);
 }
 
 static void guncon3_report(struct guncon3 *gc, const struct guncon3_state *st)
@@ -161,8 +190,8 @@ static void guncon3_report(struct guncon3 *gc, const struct guncon3_state *st)
 	spin_unlock(&gc->state_lock);
 
 	if (!(offscreen && READ_ONCE(offscreen_edge))) {
-		x = guncon3_map_axis(st->x, cal.x_min, cal.x_max);
-		y = guncon3_map_axis(st->y, cal.y_min, cal.y_max);
+		x = guncon3_map_axis(st->x, cal.x_min, cal.x_mid, cal.x_max);
+		y = guncon3_map_axis(st->y, cal.y_min, cal.y_mid, cal.y_max);
 	}
 	input_report_abs(gc->pointer, ABS_X, x);
 	input_report_abs(gc->pointer, ABS_Y, y);
@@ -178,12 +207,12 @@ static void guncon3_report(struct guncon3 *gc, const struct guncon3_state *st)
 	input_report_abs(gc->pad, ABS_RY, st->by);
 	input_report_abs(gc->pad, ABS_DISTANCE, st->z);
 	if (READ_ONCE(stick_dpad)) {
-		int dz = min_t(uint, READ_ONCE(deadzone), 127);
+		int dz = clamp_t(uint, READ_ONCE(deadzone), 2, 127);
 
-		input_report_key(gc->pad, BTN_DPAD_LEFT, st->ax < 128 - dz);
-		input_report_key(gc->pad, BTN_DPAD_RIGHT, st->ax > 128 + dz);
-		input_report_key(gc->pad, BTN_DPAD_UP, st->ay < 128 - dz);
-		input_report_key(gc->pad, BTN_DPAD_DOWN, st->ay > 128 + dz);
+		guncon3_dpad(gc->pad, BTN_DPAD_LEFT, 128 - st->ax, dz);
+		guncon3_dpad(gc->pad, BTN_DPAD_RIGHT, st->ax - 128, dz);
+		guncon3_dpad(gc->pad, BTN_DPAD_UP, 128 - st->ay, dz);
+		guncon3_dpad(gc->pad, BTN_DPAD_DOWN, st->ay - 128, dz);
 	}
 	guncon3_report_buttons(gc->pad, gc->pad_keymap, st->buttons, changed);
 	input_sync(gc->pad);
@@ -259,6 +288,14 @@ static void guncon3_irq(struct urb *urb)
 		goto resubmit;
 	}
 	gc->bad_reports = 0;
+
+	/*
+	 * A real gun's first report after the key is all zeros, which reads as
+	 * both sticks pinned up-left. No genuine report looks like that (the
+	 * sticks rest at 128), so drop it.
+	 */
+	if (!memchr_inv(payload, 0, GUNCON3_PAYLOAD_LEN))
+		goto resubmit;
 
 	guncon3_parse(payload, &st);
 	dev_dbg(&gc->intf->dev, "x=%d y=%d z=%u a=%u,%u b=%u,%u buttons=%06x\n",
@@ -340,10 +377,24 @@ static ssize_t calibration_show(struct device *dev, struct device_attribute *att
 	cal = gc->calibration;
 	spin_unlock_irq(&gc->state_lock);
 
-	return sysfs_emit(buf, "%d %d %d %d\n", cal.x_min, cal.x_max, cal.y_min, cal.y_max);
+	return sysfs_emit(buf, "%d %d %d %d %d %d\n", cal.x_min, cal.x_max, cal.y_min, cal.y_max,
+			  cal.x_mid, cal.y_mid);
 }
 
-/* Accepts "x_min x_max y_min y_max" in raw units, or "reset". */
+static bool guncon3_cal_axis_ok(s32 min, s32 mid, s32 max)
+{
+	return min < max ? min < mid && mid < max : max < mid && mid < min;
+}
+
+static bool guncon3_cal_in_range(s32 v)
+{
+	return v >= S16_MIN * 2 && v <= S16_MAX * 2;
+}
+
+/*
+ * Accepts "x_min x_max y_min y_max [x_mid y_mid]" in raw units, or "reset".
+ * Without a centre, the midpoints are used (a plain linear map).
+ */
 static ssize_t calibration_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
@@ -353,15 +404,21 @@ static ssize_t calibration_store(struct device *dev, struct device_attribute *at
 	if (sysfs_streq(buf, "reset")) {
 		cal = guncon3_default_calibration;
 	} else {
-		if (sscanf(buf, "%d %d %d %d", &cal.x_min, &cal.x_max, &cal.y_min, &cal.y_max) != 4)
+		int n = sscanf(buf, "%d %d %d %d %d %d", &cal.x_min, &cal.x_max,
+			       &cal.y_min, &cal.y_max, &cal.x_mid, &cal.y_mid);
+
+		if (n != 4 && n != 6)
 			return -EINVAL;
-		if (cal.x_min == cal.x_max || cal.y_min == cal.y_max)
-			return -EINVAL;
-		if (cal.x_min < S16_MIN * 2 || cal.x_min > S16_MAX * 2 ||
-		    cal.x_max < S16_MIN * 2 || cal.x_max > S16_MAX * 2 ||
-		    cal.y_min < S16_MIN * 2 || cal.y_min > S16_MAX * 2 ||
-		    cal.y_max < S16_MIN * 2 || cal.y_max > S16_MAX * 2)
+		if (!guncon3_cal_in_range(cal.x_min) || !guncon3_cal_in_range(cal.x_max) ||
+		    !guncon3_cal_in_range(cal.y_min) || !guncon3_cal_in_range(cal.y_max))
 			return -ERANGE;
+		if (n == 4) {
+			cal.x_mid = cal.x_min + (cal.x_max - cal.x_min) / 2;
+			cal.y_mid = cal.y_min + (cal.y_max - cal.y_min) / 2;
+		}
+		if (!guncon3_cal_axis_ok(cal.x_min, cal.x_mid, cal.x_max) ||
+		    !guncon3_cal_axis_ok(cal.y_min, cal.y_mid, cal.y_max))
+			return -EINVAL;
 	}
 
 	spin_lock_irq(&gc->state_lock);

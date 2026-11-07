@@ -18,6 +18,7 @@ Calibration is terminal-only on purpose: it works over SSH while you stand
 at the TV, under gamescope, and with no display server at all.
 """
 import argparse
+import glob
 import os
 import sys
 import time
@@ -71,12 +72,12 @@ def write_calibration(port, value, save):
 
 
 def read_raw(port):
-    """Returns (x, y, buttons), or None until the gun has sent a report."""
+    """Returns (x, y, z, buttons), or None until the gun has sent a report."""
     try:
-        x, y, _z, buttons = read_attr(port, "raw").split()
+        x, y, z, buttons = read_attr(port, "raw").split()
     except OSError:
         return None
-    return int(x), int(y), int(buttons, 16)
+    return int(x), int(y), int(z), int(buttons, 16)
 
 
 def wait_shot(port, label):
@@ -86,24 +87,49 @@ def wait_shot(port, label):
     while True:
         raw = read_raw(port)
         if raw:
-            x, y, buttons = raw
+            x, y, z, buttons = raw
             pressed = bool(buttons & TRIGGER)
             if not pressed:
                 released = True
             elif released:
                 if buttons & OFFSCREEN:
-                    print("\n  the gun does not see the sensor bar there; try again", end="", flush=True)
+                    print("\n  the gun does not see the sensors there; try again", end="", flush=True)
                     released = False
                     continue
-                print(f"   raw {x} {y}")
+                print(f"   raw {x} {y}  (z {z}, status {buttons & ~TRIGGER:06x})")
                 return x, y
         time.sleep(0.01)
 
 
+def open_gun(port):
+    """Hold the gun's input devices open: the gun only reports while one is."""
+    fds = []
+    for node in glob.glob(f"{DRIVER}/{port}/input/input*/event*"):
+        try:
+            fds.append(os.open("/dev/input/" + os.path.basename(node), os.O_RDONLY | os.O_NONBLOCK))
+        except OSError as err:
+            sys.exit(f"cannot open /dev/input/{os.path.basename(node)}: {err.strerror} (run with sudo)")
+    if not fds:
+        sys.exit(f"{port} has no input devices")
+    return fds
+
+
+def wait_fresh(port, timeout=2.0):
+    """raw keeps the last report after a close, so wait until it changes."""
+    first = read_raw(port)
+    end = time.time() + timeout
+    while time.time() < end:
+        cur = read_raw(port)
+        if cur is not None and cur != first:
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def calibrate(port, save):
-    if read_raw(port) is None:
-        sys.exit("no reports from the gun yet: something must have its input device open "
-                 "(start evtest or the game on it, or run: evtest /dev/input/by-id/...)")
+    fds = open_gun(port)
+    if not wait_fresh(port):
+        sys.exit("no reports from the gun; is it the right port, and is the sensor bar connected?")
 
     # The raw window only makes sense uncalibrated, but raw values don't
     # depend on the calibration, so nothing needs resetting first.
@@ -120,21 +146,44 @@ def calibrate(port, save):
     if x_min == x_max or y_min == y_max:
         sys.exit("corners collapsed onto one point; check the sensor bar and try again")
 
-    centre = wait_shot(port, "CENTRE (accuracy check)")
-    ex = ((centre[0] - x_min) / (x_max - x_min) - 0.5) * 100
-    ey = ((centre[1] - y_min) / (y_max - y_min) - 0.5) * 100
-    print(f"  centre lands {ex:+.1f}% horizontally, {ey:+.1f}% vertically off the middle")
-    if abs(ex) > 5 or abs(ey) > 5:
-        print("  more than 5% off: the screen edges probably bend for this sensor position "
-              "(or a corner shot slipped); consider recalibrating")
+    centre = wait_shot(port, "CENTRE")
+    x_mid, y_mid = centre
+    if not (min(x_min, x_max) < x_mid < max(x_min, x_max)
+            and min(y_min, y_max) < y_mid < max(y_min, y_max)):
+        sys.exit("the centre shot landed outside the corners; try again")
+    ex = ((x_mid - x_min) / (x_max - x_min) - 0.5) * 100
+    ey = ((y_mid - y_min) / (y_max - y_min) - 0.5) * 100
+    print(f"  without the centre point, the middle would land {ex:+.1f}% horizontally, "
+          f"{ey:+.1f}% vertically off; now corrected")
+    if abs(ex) > 15 or abs(ey) > 15:
+        print("  that is a lot: a shot may have slipped; consider recalibrating")
 
-    write_calibration(port, f"{x_min} {x_max} {y_min} {y_max}", save)
+    write_calibration(port, f"{x_min} {x_max} {y_min} {y_max} {x_mid} {y_mid}", save)
+
+
+def watch(port):
+    """Live aim and tracking state, for placing the sensors."""
+    fds = open_gun(port)
+    if not wait_fresh(port):
+        sys.exit("no reports from the gun; is it the right port, and is the sensor bar connected?")
+    print("Ctrl+C to stop. Aim around the screen; it should stay ON SCREEN everywhere you play.")
+    try:
+        while True:
+            x, y, z, buttons = read_raw(port)
+            state = "OFFSCREEN" if buttons & OFFSCREEN else "ON SCREEN"
+            print(f"\r  {state}  x {x:6d}  y {y:6d}  z {z:5d}  status {buttons:06x}  ", end="", flush=True)
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print()
+    del fds
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
+    w = sub.add_parser("watch")
+    w.add_argument("port", nargs="?")
     c = sub.add_parser("calibrate")
     c.add_argument("port", nargs="?")
     c.add_argument("--save", action="store_true")
@@ -142,7 +191,8 @@ def main():
     g.add_argument("port", nargs="?")
     s = sub.add_parser("set")
     s.add_argument("port")
-    s.add_argument("values", nargs=4, type=int)
+    s.add_argument("values", nargs="+", type=int,
+                   help="x_min x_max y_min y_max [x_mid y_mid]")
     s.add_argument("--save", action="store_true")
     r = sub.add_parser("reset")
     r.add_argument("port", nargs="?")
@@ -157,11 +207,15 @@ def main():
             saved = os.path.exists(os.path.join(CONF_DIR, f"{port}.conf"))
             print(f"{port}  calibration {read_attr(port, 'calibration')}"
                   f"{'  (saved)' if saved else ''}")
+    elif args.cmd == "watch":
+        watch(pick_port(args.port))
     elif args.cmd == "calibrate":
         calibrate(pick_port(args.port), args.save)
     elif args.cmd == "get":
         print(read_attr(pick_port(args.port), "calibration"))
     elif args.cmd == "set":
+        if len(args.values) not in (4, 6):
+            sys.exit("set takes 4 or 6 values")
         write_calibration(pick_port(args.port), " ".join(map(str, args.values)), args.save)
     elif args.cmd == "reset":
         write_calibration(pick_port(args.port), "reset", args.save)
